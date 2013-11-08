@@ -65,9 +65,24 @@ def buffer_iterator_to_line_iterator(iterator):
     wrapper puts them back into lines.
     """
     buf = iterator.next()  # might raise StopIteration, but that's okay
+
+    separator = None
     while True:
-        if '\n' in buf:
-            (line, buf) = buf.split('\n', 1)
+        if separator is None:
+            #XXX: Kiip HACK. We assume the records are separated by nulls, since
+            # We need to sniff the separator out of the data because Iris records are
+            # separated by nulls.
+            #
+            # Note that the check for \0 must come first here.
+            # When running under HadoopStreaming, it inserts a \n at the end of the record,
+            # so if we sniffed that first we would choose the wrong delimiter.
+            if '\0' in buf:
+                separator = '\0'
+            elif '\n' in buf:
+                separator = '\n'
+
+        if separator is not None and separator in buf:
+            (line, buf) = buf.split(separator, 1)
             yield line + '\n'
         else:
             try:
@@ -358,7 +373,7 @@ def read_input(path, stdin=None):
 
     # handle '-' (special case)
     if path == '-':
-        for line in stdin:
+        for line in buffer_iterator_to_line_iterator(stdin):
             yield line
         return
 
@@ -424,11 +439,7 @@ def read_file(path, fileobj=None, yields_lines=True, cleanup=None):
             else:
                 lines = bunzip2_stream(f)
         else:
-            if yields_lines:
-                lines = f
-            else:
-                # handle boto.s3.Key, which yields chunks of bytes, not lines
-                lines = buffer_iterator_to_line_iterator(f)
+            lines = buffer_iterator_to_line_iterator(f)
 
         for line in lines:
             yield line
