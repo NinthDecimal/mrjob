@@ -69,25 +69,35 @@ def buffer_iterator_to_line_iterator(iterator):
         This may append a newline to your last chunk of data. In v0.5.0
         it will not, for better compatibility with file objects.
     """
-    buf = ''
-    for chunk in iterator:
-        buf += chunk
 
-        # this is basically splitlines() without support for \r
-        start = 0
-        while True:
-            end = buf.find('\n', start) + 1
-            if end:  # if find() returned -1, end would be 0
-                yield buf[start:end]
-                start = end
-            else:
-                # this will happen eventually
-                buf = buf[start:]
-                break
+    buf = iterator.next()  # might raise StopIteration, but that's okay
 
-    if buf:
-        # in v0.5.0, don't append the newline
-        yield buf + '\n'
+    separator = None
+    while True:
+        if separator is None:
+            #XXX: Kiip HACK. We assume the records are separated by nulls, since
+            # We need to sniff the separator out of the data because Iris records are
+            # separated by nulls.
+            #
+            # Note that the check for \0 must come first here.
+            # When running under HadoopStreaming, it inserts a \n at the end of the record,
+            # so if we sniffed that first we would choose the wrong delimiter.
+            if '\0' in buf:
+                separator = '\0'
+            elif '\n' in buf:
+                separator = '\n'
+
+        if separator is not None and separator in buf:
+            (line, buf) = buf.split(separator, 1)
+            yield line + '\n'
+        else:
+            try:
+                more = iterator.next()
+                buf += more
+            except StopIteration:
+                if buf:
+                    yield buf + '\n'
+                return
 
 
 def cmd_line(args):
@@ -369,7 +379,7 @@ def read_input(path, stdin=None):
 
     # handle '-' (special case)
     if path == '-':
-        for line in stdin:
+        for line in buffer_iterator_to_line_iterator(stdin):
             yield line
         return
 
@@ -435,11 +445,7 @@ def read_file(path, fileobj=None, yields_lines=True, cleanup=None):
             else:
                 lines = bunzip2_stream(f)
         else:
-            if yields_lines:
-                lines = f
-            else:
-                # handle boto.s3.Key, which yields chunks of bytes, not lines
-                lines = buffer_iterator_to_line_iterator(f)
+            lines = buffer_iterator_to_line_iterator(f)
 
         for line in lines:
             yield line
