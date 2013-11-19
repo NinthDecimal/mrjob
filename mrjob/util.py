@@ -63,35 +63,56 @@ def bash_wrap(cmd_str):
 def buffer_iterator_to_line_iterator(iterator):
     """boto's file iterator splits by buffer size instead of by newline. This
     wrapper puts them back into lines.
+
+    .. warning::
+
+        This may append a newline to your last chunk of data. In v0.5.0
+        it will not, for better compatibility with file objects.
     """
-    buf = iterator.next()  # might raise StopIteration, but that's okay
-
+    #XXX: Kiip HACK.
+    # We need to detect the record separator because Iris data is separated by nulls
+    # instead of newlines as Hadoop expects.
+    #
+    # We still need to support \n for other files.
+    #
+    # Note that the check for \0 must come first here.
+    # When running under HadoopStreaming, it inserts a \n at the end of the record,
+    # so if we sniffed that first we would choose the wrong delimiter.
     separator = None
-    while True:
-        if separator is None:
-            #XXX: Kiip HACK. We assume the records are separated by nulls, since
-            # We need to sniff the separator out of the data because Iris records are
-            # separated by nulls.
-            #
-            # Note that the check for \0 must come first here.
-            # When running under HadoopStreaming, it inserts a \n at the end of the record,
-            # so if we sniffed that first we would choose the wrong delimiter.
-            if '\0' in buf:
-                separator = '\0'
-            elif '\n' in buf:
-                separator = '\n'
+    sep_buf = ''
+    for chunk in iterator:
+        sep_buf += chunk
+        if '\0' in chunk:
+            separator = '\0'
+            break
+        elif '\n' in chunk:
+            separator = '\n'
+            break
 
-        if separator is not None and separator in buf:
-            (line, buf) = buf.split(separator, 1)
-            yield line + '\n'
-        else:
-            try:
-                more = iterator.next()
-                buf += more
-            except StopIteration:
-                if buf:
-                    yield buf + '\n'
-                return
+    buf = ''
+    for chunk in itertools.chain(sep_buf, iterator):
+        buf += chunk
+
+        # this is basically splitlines() without support for \r
+        start = 0
+        while True:
+            end = buf.find(separator, start) + 1
+            if end:  # if find() returned -1, end would be 0
+                #XXX: Ensure the last character is a \n in case we use \0 separator
+                yield buf[start:end - 1] + '\n'
+                start = end
+            else:
+                # this will happen eventually
+                buf = buf[start:]
+                break
+
+    if buf:
+        # in v0.5.0, don't append the newline
+        yield buf + '\n'
+
+
+def _detect_separator(buf):
+    return None
 
 
 def cmd_line(args):
@@ -452,19 +473,49 @@ def read_file(path, fileobj=None, yields_lines=True, cleanup=None):
                 cleanup()
 
 
-def bunzip2_stream(fileobj):
-    """Return an uncompressed bz2 stream from a file object
+def _bunzip2_stream(fileobj, bufsize=1024):
+    """Decompress gzipped data on the fly.
+
+    :param fileobj: object supporting ``read()``
+    :param bufsize: number of bytes to read from *fileobj* at a time.
+
+    This yields decompressed chunks; it does *not* split on lines. To get
+    lines, wrap this in :py:func:`buffer_iterator_to_line_iterator`.
+
+    This will replace :py:func:`bunzip2_stream` in v0.5.0 as part of
+    an effort to be less line-based (see #715).
     """
-    # decompress chunks into a buffer, then stream from the buffer
-    buffer = ''
     if bz2 is None:
         raise Exception(
             'bz2 module was not successfully imported (likely not installed).')
-    decomp = bz2.BZ2Decompressor()
-    for part in fileobj:
-        buffer = buffer.join(decomp.decompress(part))
-    f = buffer.splitlines(True)
-    return f
+
+    d = bz2.BZ2Decompressor()
+
+    while True:
+        chunk = fileobj.read(bufsize)
+        if not chunk:
+            return
+
+        parts = d.decompress(chunk)
+        for part in parts:
+            yield part
+
+
+def bunzip2_stream(fileobj, bufsize=1024):
+    """Decompress gzipped data on the fly.
+
+    :param fileobj: object supporting ``read()``
+    :param bufsize: number of bytes to read from *fileobj* at a time.
+
+    .. warning::
+
+        This yields lines for backwards compatibility only; in v0.5.0
+        it will yield arbitrary chunks of data as part of supporting
+        non-line-based protocols (see `Issue #715
+        <https://github.com/Yelp/mrjob/issues/715>`_). If you want lines,
+        wrap this in :py:func:`buffer_iterator_to_line_iterator`.
+    """
+    return buffer_iterator_to_line_iterator(_bunzip2_stream(fileobj, bufsize))
 
 
 def gunzip_stream(fileobj, bufsize=1024):
@@ -474,8 +525,10 @@ def gunzip_stream(fileobj, bufsize=1024):
     :param bufsize: number of bytes to read from *fileobj* at a time. The
                     default is the same as in :py:mod:`gzip`.
 
-    This yields decompressed chunks; it does *not* split on lines. Use
-    :py:func:`buffer_iterator_to_line_iterator` for that.
+    .. warning::
+
+        This yields decompressed chunks; it does *not* split on lines. To get
+        lines, wrap this in :py:func:`buffer_iterator_to_line_iterator`.
     """
     # see Issue #601 for why we need this.
 
